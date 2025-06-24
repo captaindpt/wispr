@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.wispr.service</string>
+    
+    <key>ProgramArguments</key>
+    <array>
+        <string>REPLACE_WITH_PYTHON_PATH</string>
+        <string>REPLACE_WITH_WISPR_PATH/wispr.py</string>
+    </array>
+    
+    <key>RunAtLoad</key>
+    <true/>
+    
+    <key>KeepAlive</key>
+    <true/>
+    
+    <key>WorkingDirectory</key>
+    <string>REPLACE_WITH_WISPR_PATH</string>
+    
+    <key>StandardOutPath</key>
+    <string>REPLACE_WITH_LOG_PATH/wispr.log</string>
+    
+    <key>StandardErrorPath</key>
+    <string>REPLACE_WITH_LOG_PATH/wispr_error.log</string>
+    
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin</string>
+        <key>PYTHONPATH</key>
+        <string>REPLACE_WITH_WISPR_PATH</string>
+    </dict>
+    
+    <key>ProcessType</key>
+    <string>Interactive</string>
+    
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+</dict>
+</plist> 
