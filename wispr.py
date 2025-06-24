@@ -14,6 +14,8 @@ import websocket
 import pyaudio
 import wave
 import logging
+import signal
+import atexit
 from pathlib import Path
 from datetime import datetime
 from dotenv import load_dotenv
@@ -30,32 +32,40 @@ load_dotenv()
 
 # Configure logging
 def setup_logging():
-    """Setup logging to standard macOS location"""
+    """Setup logging to standard macOS location - FIXED DUPLICATE HANDLERS"""
     log_dir = Path.home() / "Library" / "Logs" / "Wispr"
     log_dir.mkdir(parents=True, exist_ok=True)
     
     log_file = log_dir / "wispr.log"
     transcript_log_file = log_dir / "transcriptions.log"
     
-    # Configure main app logging
+    # Clear any existing handlers to prevent duplicates
+    root_logger = logging.getLogger()
+    root_logger.handlers.clear()
+    
+    # Configure main app logging using root logger ONLY
+    # For background service: only log to file (launchd handles stdout redirect)
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(levelname)s - %(message)s',
         handlers=[
-            logging.FileHandler(log_file),
-            logging.StreamHandler(sys.stdout)
-        ]
+            logging.FileHandler(log_file)
+            # NO StreamHandler for background service - launchd handles stdout
+        ],
+        force=True  # Force reconfiguration
     )
     
     # Configure transcript logging (separate file for all voice interactions)
     transcript_logger = logging.getLogger('wispr.transcripts')
+    # Clear existing handlers
+    transcript_logger.handlers.clear()
     transcript_handler = logging.FileHandler(transcript_log_file)
     transcript_handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
     transcript_logger.addHandler(transcript_handler)
     transcript_logger.setLevel(logging.INFO)
     transcript_logger.propagate = False  # Don't propagate to main logger
     
-    return logging.getLogger('wispr'), transcript_logger
+    return logging.getLogger(), transcript_logger  # Use root logger directly
 
 logger, transcript_logger = setup_logging()
 
@@ -99,8 +109,31 @@ last_error_time = 0
 recording_start_time = 0  # Track actual recording start
 DEBOUNCE_DELAY = 0.3 # 300ms debounce
 MIN_RECORDING_DURATION = 0.5  # 500ms minimum recording
-CONNECTION_COOLDOWN = 2.0  # 2 seconds between connections (more conservative)
-ERROR_COOLDOWN = 5.0  # 5 seconds after errors
+# PRODUCTION-READY COOLDOWNS for indefinite background operation
+CONNECTION_COOLDOWN = 3.0  # 3 seconds between connections (more conservative)
+ERROR_COOLDOWN = 10.0  # 10 seconds after errors (much more conservative)
+POLICY_VIOLATION_COOLDOWN = 30.0  # 30 seconds after 1008 policy violations
+
+# Global variables for robust state management
+global_event_monitor = None  # Track single event monitor
+handler_active = False       # Prevent handler re-entry
+
+# Declare all global variables used throughout the application
+audio = None
+stream = None
+ws_app = None
+ws_thread = None
+recording = False
+connecting = False
+connection_active = False
+trigger_pressed = False
+last_trigger_time = 0
+last_stop_time = 0
+recent_errors = 0
+last_error_time = 0
+recording_start_time = 0
+final_transcript = ""
+stop_event = threading.Event()
 
 def init_audio():
     """Initialize PyAudio"""
@@ -216,35 +249,48 @@ def on_ws_close(ws, close_status_code, close_msg):
     if close_status_code:
         logger.warning(f"🔌 Disconnected: {close_status_code}")
         if close_status_code == 1008:
-            logger.warning("⚠️ Policy violation detected - enforcing longer cooldown")
+            logger.warning("⚠️ Policy violation detected - enforcing LONG cooldown for background stability")
             recent_errors += 1
             last_error_time = time.time()
-            last_stop_time = time.time()  # Force cooldown
+            # Force much longer cooldown for policy violations
+            last_stop_time = time.time() + POLICY_VIOLATION_COOLDOWN - CONNECTION_COOLDOWN
     recording = False
     connecting = False
     connection_active = False
     cleanup_audio()
 
 def start_recording():
-    """Start recording"""
+    """Start recording - ROBUST STATE MANAGEMENT"""
     global recording, connecting, stream, ws_app, ws_thread, stop_event, final_transcript, last_stop_time, connection_active, recent_errors, last_error_time
     
+    # CRITICAL: Prevent overlapping recordings/connections
     if recording or connecting or connection_active:
-        logger.warning("⚠️ Recording already in progress or connection active")
+        logger.warning("⚠️ Recording already in progress or connection active - BLOCKED")
         return
     
-    # Enforce connection cooldown (longer after errors)
+    # CRITICAL: Check if WebSocket thread is still alive from previous session
+    if ws_thread and ws_thread.is_alive():
+        logger.warning("⚠️ Previous WebSocket thread still active - BLOCKED")
+        return
+    
+    # CRITICAL: Check if WebSocket app still exists
+    if ws_app and hasattr(ws_app, 'sock') and ws_app.sock:
+        logger.warning("⚠️ Previous WebSocket connection still active - BLOCKED")
+        return
+    
+    # ROBUST CONNECTION COOLDOWN for background stability
     current_time = time.time()
     cooldown_needed = CONNECTION_COOLDOWN
     
-    # If we've had recent errors, use longer cooldown
-    if recent_errors > 0 and (current_time - last_error_time) < 30:  # Reset error count after 30s
-        cooldown_needed = ERROR_COOLDOWN
-        logger.warning(f"⚠️ Recent errors detected ({recent_errors}), using {ERROR_COOLDOWN}s cooldown")
-    else:
-        # Reset error count if enough time has passed
-        if (current_time - last_error_time) > 30:
-            recent_errors = 0
+    # Reset error count if enough time has passed (60s for production)
+    if (current_time - last_error_time) > 60:
+        recent_errors = 0
+    
+    # If we've had recent errors, use exponentially longer cooldown
+    if recent_errors > 0 and (current_time - last_error_time) < 60:
+        # Exponential backoff: 10s, 20s, 40s, capped at 60s
+        cooldown_needed = min(ERROR_COOLDOWN * (2 ** (recent_errors - 1)), 60.0)
+        logger.warning(f"⚠️ Recent errors detected ({recent_errors}), using {cooldown_needed}s cooldown for stability")
     
     if current_time - last_stop_time < cooldown_needed:
         logger.info(f"⏳ Connection cooldown: {cooldown_needed - (current_time - last_stop_time):.1f}s remaining")
@@ -447,76 +493,149 @@ def paste_text(text):
         transcript_logger.error(f"PASTE_ERROR: {e}")
 
 def handler(event):
-    """Global key event handler"""
-    global trigger_pressed, last_trigger_time
+    """Global key event handler - SINGLE UNIFIED HANDLER"""
+    global trigger_pressed, last_trigger_time, handler_active
     
-    current_time = time.time()
-    if current_time - last_trigger_time < DEBOUNCE_DELAY:
-        return # Debounce
-
+    # Prevent re-entrant handler calls
+    if handler_active:
+        return
+    
+    handler_active = True
+    
     try:
+        current_time = time.time()
+        if current_time - last_trigger_time < DEBOUNCE_DELAY:
+            return # Debounce
+
         event_type = event.type()
         key_code = event.keyCode()
         flags = event.modifierFlags()
         
-        # Debug output - remove this line to reduce noise
-        # print(f"🔘 Key: type={event_type}, code={key_code}, flags={flags}")
-        
+        # SINGLE TRIGGER KEY LOGIC - NO DUPLICATES
         is_trigger = is_trigger_key(key_code, flags)
-        
-        # Special handling for Fn key based on flags
-        if TRIGGER_KEY == 'fn' and is_trigger:
+        if not is_trigger:
+            return
+            
+        # Handle Fn key based on flags (special case)
+        if TRIGGER_KEY == 'fn':
             fn_currently_pressed = is_fn_pressed(flags)
             
             if fn_currently_pressed and not trigger_pressed:
                 logger.info("🎤 Recording started...")
-                play_sound("sounds/press.wav")  # Play press sound
+                play_sound("sounds/press.wav")
                 trigger_pressed = True
                 last_trigger_time = current_time
                 threading.Thread(target=start_recording, daemon=True).start()
             elif not fn_currently_pressed and trigger_pressed:
                 logger.info("🛑 Recording stopped...")
-                play_sound("sounds/release.wav")  # Play release sound
+                play_sound("sounds/release.wav")
                 trigger_pressed = False
                 last_trigger_time = current_time
                 threading.Thread(target=stop_recording, daemon=True).start()
         
-        # Regular key handling for other trigger keys
-        elif TRIGGER_KEY != 'fn' and is_trigger:
-            # Key down or flags changed (for modifier keys)
+        # Handle all other trigger keys (unified logic)
+        else:
+            # Key down
             if (event_type == NSKeyDownMask or event_type == NSFlagsChangedMask) and not trigger_pressed:
                 logger.info("🎤 Recording started...")
-                play_sound("sounds/press.wav")  # Play press sound
+                play_sound("sounds/press.wav")
                 trigger_pressed = True
                 last_trigger_time = current_time
                 threading.Thread(target=start_recording, daemon=True).start()
             
-            # Key up or flags changed (for modifier keys)
+            # Key up
             elif (event_type == NSKeyUpMask or event_type == NSFlagsChangedMask) and trigger_pressed:
                 logger.info("🛑 Recording stopped...")
-                play_sound("sounds/release.wav")  # Play release sound
+                play_sound("sounds/release.wav")
                 trigger_pressed = False
                 last_trigger_time = current_time
                 threading.Thread(target=stop_recording, daemon=True).start()
         
     except Exception as e:
         logger.error(f"❌ Key handler error: {e}")
+    finally:
+        handler_active = False
 
 class AppDelegate(NSObject):
     def applicationDidFinishLaunching_(self, notification):
-        """App finished launching"""
+        """App finished launching - ROBUST SINGLE HANDLER REGISTRATION"""
+        global global_event_monitor
+        
+        # Ensure no existing monitor
+        if global_event_monitor:
+            logger.warning("⚠️ Removing existing event monitor")
+            NSEvent.removeMonitor_(global_event_monitor)
+            global_event_monitor = None
+        
+        # Register SINGLE global event monitor
         mask = NSKeyDownMask | NSKeyUpMask | NSFlagsChangedMask
-        NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(mask, handler)
-        logger.info("✅ Global key monitoring started")
+        global_event_monitor = NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(mask, handler)
+        
+        if global_event_monitor:
+            logger.info("✅ Global key monitoring started")
+        else:
+            logger.error("❌ Failed to register global event monitor")
+
+def cleanup_application():
+    """Robust application cleanup"""
+    global audio, global_event_monitor, ws_app, ws_thread, recording, connecting, connection_active
+    
+    logger.info("🧹 Cleaning up application resources...")
+    
+    # Stop all recording/connection activity
+    recording = False
+    connecting = False
+    connection_active = False
+    stop_event.set()
+    
+    # Clean up event monitor
+    if global_event_monitor:
+        try:
+            NSEvent.removeMonitor_(global_event_monitor)
+            logger.info("✅ Event monitor removed")
+        except Exception as e:
+            logger.error(f"❌ Event monitor cleanup error: {e}")
+    
+    # Clean up WebSocket
+    if ws_app:
+        try:
+            ws_app.close()
+        except:
+            pass
+    
+    # Wait for WebSocket thread
+    if ws_thread and ws_thread.is_alive():
+        try:
+            ws_thread.join(timeout=2.0)
+        except:
+            pass
+    
+    # Clean up audio
+    cleanup_audio()
+    if audio:
+        try:
+            audio.terminate()
+            logger.info("✅ Audio system terminated")
+        except Exception as e:
+            logger.error(f"❌ Audio cleanup error: {e}")
 
 def main():
-    """Main function"""
-    logger.info("🎤 Starting Wispr Flow (Simple)...")
+    """Main function - ROBUST STARTUP AND CLEANUP"""
+    # Logging already setup at module level - don't call setup_logging() again!
+    
+    # Ensure only one instance is running
+    pid_file = ensure_single_instance()
+    logger.info(f"Single instance protection enabled (PID file: {pid_file})")
+    
+    logger.info("🎤 Starting Wispr...")
     logger.info("📋 Make sure to grant Accessibility and Microphone permissions")
     logger.info(f"🎯 Trigger key: {TRIGGER_KEY}")
     
     if not init_audio():
         sys.exit(1)
+    
+    # Register cleanup handler
+    atexit.register(cleanup_application)
     
     # Create NSApplication
     app = NSApplication.sharedApplication()
@@ -524,14 +643,75 @@ def main():
     NSApp().setDelegate_(delegate)
     
     try:
+        logger.info("✅ Wispr is ready! Hold fn to start recording")
         AppHelper.runEventLoop()
     except KeyboardInterrupt:
         logger.info("\n👋 Goodbye!")
     except Exception as e:
         logger.error(f"❌ Error: {e}")
+        raise
     finally:
-        if audio:
-            audio.terminate()
+        cleanup_application()
+
+# Single instance protection
+def ensure_single_instance():
+    """Ensure only one instance of Wispr is running"""
+    pid_file = Path.home() / "Library" / "Application Support" / "Wispr" / "wispr.pid"
+    pid_file.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Check if PID file exists
+    if pid_file.exists():
+        try:
+            with open(pid_file, 'r') as f:
+                old_pid = int(f.read().strip())
+            
+            # Check if process is still running
+            try:
+                os.kill(old_pid, 0)  # Signal 0 just checks if process exists
+                # Process exists, try to kill it
+                logger.warning(f"⚠️ Found existing Wispr process (PID {old_pid}), terminating it...")
+                os.kill(old_pid, signal.SIGTERM)
+                time.sleep(1)
+                
+                # Check if it's still running
+                try:
+                    os.kill(old_pid, 0)
+                    logger.error(f"❌ Failed to terminate existing process (PID {old_pid})")
+                    sys.exit(1)
+                except ProcessLookupError:
+                    logger.info(f"✅ Successfully terminated existing process")
+                    
+            except ProcessLookupError:
+                # Process doesn't exist, PID file is stale
+                logger.info("🧹 Removing stale PID file")
+                
+        except (ValueError, IOError):
+            logger.warning("⚠️ Invalid PID file, removing")
+    
+    # Write our PID
+    with open(pid_file, 'w') as f:
+        f.write(str(os.getpid()))
+    
+    # Clean up PID file on exit
+    def cleanup_pid_file():
+        try:
+            if pid_file.exists():
+                pid_file.unlink()
+        except:
+            pass
+    
+    atexit.register(cleanup_pid_file)
+    
+    # Handle signals for clean shutdown
+    def signal_handler(signum, frame):
+        logger.info(f"📡 Received signal {signum}, shutting down...")
+        cleanup_pid_file()
+        sys.exit(0)
+    
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+    
+    return pid_file
 
 if __name__ == "__main__":
     main() 
