@@ -2,6 +2,12 @@
 
 I didn't want to pay for Wispr Flow, so I made my own.
 
+## How It Works
+
+Hold the Fn key, talk into your microphone, release the Fn key. The transcribed text gets pasted wherever your cursor is. That's it.
+
+Works in any application - text editors, browsers, chat apps, anywhere you can type. The system runs in the background and responds instantly to the Fn key trigger.
+
 ## Technical Overview
 
 This is a production-grade voice-to-text transcription system for macOS that uses the Fn key as a global hotkey trigger. The implementation leverages native macOS Cocoa APIs for system-level key monitoring and integrates with AssemblyAI's real-time streaming transcription service.
