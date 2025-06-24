@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Wispr - Voice-to-Text Transcription Service for macOS
-Professional background service with Fn key trigger and auto-paste functionality
+Simple Wispr Flow implementation using Cocoa global key monitoring
+Based on: https://gist.github.com/ljos/3019549
 """
 
 import os
@@ -13,9 +13,6 @@ import subprocess
 import websocket
 import pyaudio
 import wave
-import logging
-from pathlib import Path
-from datetime import datetime
 from dotenv import load_dotenv
 
 # macOS imports
@@ -28,43 +25,12 @@ from AppKit import NSPasteboard, NSStringPboardType
 # Load environment
 load_dotenv()
 
-# Configure logging
-def setup_logging():
-    """Setup logging to standard macOS location"""
-    log_dir = Path.home() / "Library" / "Logs" / "Wispr"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    
-    log_file = log_dir / "wispr.log"
-    transcript_log_file = log_dir / "transcriptions.log"
-    
-    # Configure main app logging
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler(log_file),
-            logging.StreamHandler(sys.stdout)
-        ]
-    )
-    
-    # Configure transcript logging (separate file for all voice interactions)
-    transcript_logger = logging.getLogger('wispr.transcripts')
-    transcript_handler = logging.FileHandler(transcript_log_file)
-    transcript_handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
-    transcript_logger.addHandler(transcript_handler)
-    transcript_logger.setLevel(logging.INFO)
-    transcript_logger.propagate = False  # Don't propagate to main logger
-    
-    return logging.getLogger('wispr'), transcript_logger
-
-logger, transcript_logger = setup_logging()
-
 # Config
 API_KEY = os.getenv('ASSEMBLYAI_API_KEY')
 TRIGGER_KEY = os.getenv('WISPR_TRIGGER_KEY', 'fn')
 
 if not API_KEY or API_KEY == 'your_api_key_here':
-    logger.error("Please edit .env and add your AssemblyAI API key")
+    print("❌ Please edit .env and add your AssemblyAI API key")
     sys.exit(1)
 
 # Audio settings
@@ -86,7 +52,6 @@ trigger_pressed = False
 recording = False
 connecting = False  # Track connection state
 connection_active = False  # Track if we have an active connection
-recent_errors = 0  # Track recent connection errors
 audio = None
 stream = None
 ws_app = None
@@ -95,22 +60,20 @@ stop_event = threading.Event()
 final_transcript = ""
 last_trigger_time = 0
 last_stop_time = 0
-last_error_time = 0
 recording_start_time = 0  # Track actual recording start
 DEBOUNCE_DELAY = 0.3 # 300ms debounce
 MIN_RECORDING_DURATION = 0.5  # 500ms minimum recording
 CONNECTION_COOLDOWN = 2.0  # 2 seconds between connections (more conservative)
-ERROR_COOLDOWN = 5.0  # 5 seconds after errors
 
 def init_audio():
     """Initialize PyAudio"""
     global audio
     try:
         audio = pyaudio.PyAudio()
-        logger.info("✅ Audio system initialized")
+        print("✅ Audio system initialized")
         return True
     except Exception as e:
-        logger.error(f"❌ Audio initialization failed: {e}")
+        print(f"❌ Audio initialization failed: {e}")
         return False
 
 def play_sound(sound_file):
@@ -120,7 +83,7 @@ def play_sound(sound_file):
             # Use macOS built-in afplay for simple and reliable playback
             subprocess.run(['afplay', sound_file], check=True, capture_output=True)
         except Exception as e:
-            logger.error(f"❌ Sound playback error: {e}")
+            print(f"❌ Sound playback error: {e}")
     
     # Play sound in background thread to not block main functionality
     threading.Thread(target=_play, daemon=True).start()
@@ -148,7 +111,7 @@ def is_fn_pressed(flags):
 def on_ws_open(ws):
     """WebSocket opened"""
     global recording, connecting, recording_start_time, connection_active
-    logger.info("🔗 Connected to AssemblyAI")
+    print("🔗 Connected to AssemblyAI")
     connecting = False
     recording = True
     connection_active = True
@@ -162,7 +125,7 @@ def on_ws_open(ws):
                     data = stream.read(FRAMES_PER_BUFFER, exception_on_overflow=False)
                     ws.send(data, websocket.ABNF.OPCODE_BINARY)
             except Exception as e:
-                logger.error(f"❌ Streaming error: {e}")
+                print(f"❌ Streaming error: {e}")
                 break
     
     threading.Thread(target=stream_audio, daemon=True).start()
@@ -176,7 +139,7 @@ def on_ws_message(ws, message):
         
         if msg_type == "Begin":
             session_id = data.get('id')
-            logger.info(f"🔗 Session started: {session_id}")
+            print(f"🔗 Session started: {session_id}")
         elif msg_type == "Turn":
             transcript = data.get('transcript', '')
             formatted = data.get('turn_is_formatted', False)
@@ -188,23 +151,21 @@ def on_ws_message(ws, message):
                         final_transcript += " " + transcript_text
                     else:
                         final_transcript = transcript_text
-                    logger.info(f"📝 Added segment: \"{transcript_text}\"")
-                    logger.info(f"📝 Full transcript so far: \"{final_transcript}\"")
-                    # Log transcript segment to dedicated log
-                    transcript_logger.info(f"SEGMENT: {transcript_text}")
+                    print(f"📝 Added segment: \"{transcript_text}\"")
+                    print(f"📝 Full transcript so far: \"{final_transcript}\"")
                     # Don't paste yet! Wait for Fn key release
             else:
                 # Partial transcript, show as it comes
-                print(f"\r{transcript}", end='')  # Use print for real-time display
+                print(f"\r{transcript}", end='')
         elif msg_type == "Termination":
-            logger.info("🔚 Session terminated")
+            print("🔚 Session terminated")
     except Exception as e:
-        logger.error(f"❌ Message handling error: {e}")
+        print(f"❌ Message handling error: {e}")
 
 def on_ws_error(ws, error):
     """WebSocket error"""
     global recording, connecting, connection_active
-    logger.error(f"❌ Connection error: {error}")
+    print(f"❌ Connection error: {error}")
     stop_event.set()
     recording = False
     connecting = False
@@ -212,13 +173,11 @@ def on_ws_error(ws, error):
 
 def on_ws_close(ws, close_status_code, close_msg):
     """WebSocket closed"""
-    global recording, connecting, last_stop_time, connection_active, recent_errors, last_error_time
+    global recording, connecting, last_stop_time, connection_active
     if close_status_code:
-        logger.warning(f"🔌 Disconnected: {close_status_code}")
+        print(f"🔌 Disconnected: {close_status_code}")
         if close_status_code == 1008:
-            logger.warning("⚠️ Policy violation detected - enforcing longer cooldown")
-            recent_errors += 1
-            last_error_time = time.time()
+            print("⚠️ Policy violation detected - enforcing longer cooldown")
             last_stop_time = time.time()  # Force cooldown
     recording = False
     connecting = False
@@ -227,27 +186,17 @@ def on_ws_close(ws, close_status_code, close_msg):
 
 def start_recording():
     """Start recording"""
-    global recording, connecting, stream, ws_app, ws_thread, stop_event, final_transcript, last_stop_time, connection_active, recent_errors, last_error_time
+    global recording, connecting, stream, ws_app, ws_thread, stop_event, final_transcript, last_stop_time, connection_active
     
     if recording or connecting or connection_active:
-        logger.warning("⚠️ Recording already in progress or connection active")
+        print("⚠️ Recording already in progress or connection active")
         return
     
-    # Enforce connection cooldown (longer after errors)
+    # Enforce connection cooldown (longer after 1008 errors)
     current_time = time.time()
     cooldown_needed = CONNECTION_COOLDOWN
-    
-    # If we've had recent errors, use longer cooldown
-    if recent_errors > 0 and (current_time - last_error_time) < 30:  # Reset error count after 30s
-        cooldown_needed = ERROR_COOLDOWN
-        logger.warning(f"⚠️ Recent errors detected ({recent_errors}), using {ERROR_COOLDOWN}s cooldown")
-    else:
-        # Reset error count if enough time has passed
-        if (current_time - last_error_time) > 30:
-            recent_errors = 0
-    
     if current_time - last_stop_time < cooldown_needed:
-        logger.info(f"⏳ Connection cooldown: {cooldown_needed - (current_time - last_stop_time):.1f}s remaining")
+        print(f"⏳ Connection cooldown: {cooldown_needed - (current_time - last_stop_time):.1f}s remaining")
         return
     
     connecting = True
@@ -281,7 +230,7 @@ def start_recording():
         ws_thread.start()
         
     except Exception as e:
-        logger.error(f"❌ Recording start error: {e}")
+        print(f"❌ Recording start error: {e}")
         connecting = False
         recording = False
         connection_active = False
@@ -299,7 +248,7 @@ def stop_recording():
         recording_duration = current_time - recording_start_time
         
         if recording_duration < MIN_RECORDING_DURATION:
-            logger.warning(f"⚠️ Recording too short ({recording_duration:.1f}s < {MIN_RECORDING_DURATION}s), ignoring")
+            print(f"⚠️ Recording too short ({recording_duration:.1f}s < {MIN_RECORDING_DURATION}s), ignoring")
             recording = False
             connecting = False
             connection_active = False
@@ -308,7 +257,7 @@ def stop_recording():
             return
     elif connecting:
         # If we're still connecting, don't allow immediate stop
-        logger.warning(f"⚠️ Still connecting, ignoring rapid stop")
+        print(f"⚠️ Still connecting, ignoring rapid stop")
         return
     
     recording = False
@@ -325,7 +274,7 @@ def stop_recording():
                 ws_app.send(json.dumps(terminate_message))
                 time.sleep(0.1)
         except Exception as e:
-            logger.error(f"❌ Termination error: {e}")
+            print(f"❌ Termination error: {e}")
     
     # Close WebSocket with proper cleanup sequence
     if ws_app:
@@ -344,11 +293,11 @@ def stop_recording():
                     if thread_to_join.is_alive():
                         thread_to_join.join(timeout=3.0)
                         if thread_to_join.is_alive():
-                            logger.warning("⚠️ WebSocket thread did not terminate cleanly")
+                            print("⚠️ WebSocket thread did not terminate cleanly")
                 except Exception as e:
-                    logger.error(f"❌ Thread join error: {e}")
+                    print(f"❌ Thread join error: {e}")
         except Exception as e:
-            logger.error(f"❌ WebSocket close error: {e}")
+            print(f"❌ WebSocket close error: {e}")
         finally:
             # Force cleanup
             ws_app = None
@@ -356,9 +305,7 @@ def stop_recording():
     
     # NOW paste the final transcript when Fn key is released
     if final_transcript:
-        logger.info(f"📋 Pasting: \"{final_transcript}\"")
-        # Log complete transcription to dedicated log
-        transcript_logger.info(f"COMPLETE_TRANSCRIPT: {final_transcript}")
+        print(f"📋 Pasting: \"{final_transcript}\"")
         paste_text(final_transcript)
         final_transcript = ""  # Clear it
     
@@ -385,7 +332,7 @@ def cleanup_audio():
                 stream.close()
                 
         except Exception as e:
-            logger.error(f"❌ Audio cleanup error: {e}")
+            print(f"❌ Audio cleanup error: {e}")
         finally:
             stream = None
     
@@ -402,49 +349,22 @@ def cleanup_audio():
     ws_thread = None
 
 def paste_text(text):
-    """Paste text at cursor while preserving original clipboard"""
+    """Paste text at cursor"""
     try:
-        # Get current clipboard content to restore later
+        # Copy to clipboard
         pasteboard = NSPasteboard.generalPasteboard()
-        original_clipboard = None
-        
-        # Save original clipboard if it exists
-        if pasteboard.stringForType_(NSStringPboardType):
-            original_clipboard = pasteboard.stringForType_(NSStringPboardType)
-            logger.info(f"📋 Saved original clipboard")
-        
-        # Temporarily set our text to clipboard
         pasteboard.clearContents()
-        success = pasteboard.setString_forType_(text, NSStringPboardType)
-        if not success:
-            logger.error("❌ Failed to set clipboard")
-            return
+        pasteboard.setString_forType_(text, NSStringPboardType)
         
-        # Wait for clipboard to be set
-        time.sleep(0.05)
-        
-        # Paste using system shortcut
+        # Paste
+        time.sleep(0.1)
         script = 'tell application "System Events" to keystroke "v" using command down'
         subprocess.run(['osascript', '-e', script], check=True)
         
-        # Wait for paste to complete before restoring clipboard
-        time.sleep(0.2)
-        
-        # Restore original clipboard content
-        pasteboard.clearContents()
-        if original_clipboard:
-            pasteboard.setString_forType_(original_clipboard, NSStringPboardType)
-            logger.info(f"📋 Restored original clipboard")
-        else:
-            logger.info(f"📋 Cleared clipboard (was empty)")
-        
-        logger.info(f"📋 Pasted: \"{text}\"")
-        # Log paste action to transcript log
-        transcript_logger.info(f"PASTED: {text}")
+        print(f"📋 Pasted: \"{text}\"")
         
     except Exception as e:
-        logger.error(f"❌ Paste error: {e}")
-        transcript_logger.error(f"PASTE_ERROR: {e}")
+        print(f"❌ Paste error: {e}")
 
 def handler(event):
     """Global key event handler"""
@@ -469,13 +389,13 @@ def handler(event):
             fn_currently_pressed = is_fn_pressed(flags)
             
             if fn_currently_pressed and not trigger_pressed:
-                logger.info("🎤 Recording started...")
+                print("🎤 Recording started...")
                 play_sound("sounds/press.wav")  # Play press sound
                 trigger_pressed = True
                 last_trigger_time = current_time
                 threading.Thread(target=start_recording, daemon=True).start()
             elif not fn_currently_pressed and trigger_pressed:
-                logger.info("🛑 Recording stopped...")
+                print("🛑 Recording stopped...")
                 play_sound("sounds/release.wav")  # Play release sound
                 trigger_pressed = False
                 last_trigger_time = current_time
@@ -485,7 +405,7 @@ def handler(event):
         elif TRIGGER_KEY != 'fn' and is_trigger:
             # Key down or flags changed (for modifier keys)
             if (event_type == NSKeyDownMask or event_type == NSFlagsChangedMask) and not trigger_pressed:
-                logger.info("🎤 Recording started...")
+                print("🎤 Recording started...")
                 play_sound("sounds/press.wav")  # Play press sound
                 trigger_pressed = True
                 last_trigger_time = current_time
@@ -493,27 +413,27 @@ def handler(event):
             
             # Key up or flags changed (for modifier keys)
             elif (event_type == NSKeyUpMask or event_type == NSFlagsChangedMask) and trigger_pressed:
-                logger.info("🛑 Recording stopped...")
+                print("🛑 Recording stopped...")
                 play_sound("sounds/release.wav")  # Play release sound
                 trigger_pressed = False
                 last_trigger_time = current_time
                 threading.Thread(target=stop_recording, daemon=True).start()
         
     except Exception as e:
-        logger.error(f"❌ Key handler error: {e}")
+        print(f"❌ Key handler error: {e}")
 
 class AppDelegate(NSObject):
     def applicationDidFinishLaunching_(self, notification):
         """App finished launching"""
         mask = NSKeyDownMask | NSKeyUpMask | NSFlagsChangedMask
         NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(mask, handler)
-        logger.info("✅ Global key monitoring started")
+        print("✅ Global key monitoring started")
 
 def main():
     """Main function"""
-    logger.info("🎤 Starting Wispr Flow (Simple)...")
-    logger.info("📋 Make sure to grant Accessibility and Microphone permissions")
-    logger.info(f"🎯 Trigger key: {TRIGGER_KEY}")
+    print("🎤 Starting Wispr Flow (Simple)...")
+    print("📋 Make sure to grant Accessibility and Microphone permissions")
+    print(f"🎯 Trigger key: {TRIGGER_KEY}")
     
     if not init_audio():
         sys.exit(1)
@@ -526,9 +446,9 @@ def main():
     try:
         AppHelper.runEventLoop()
     except KeyboardInterrupt:
-        logger.info("\n👋 Goodbye!")
+        print("\n👋 Goodbye!")
     except Exception as e:
-        logger.error(f"❌ Error: {e}")
+        print(f"❌ Error: {e}")
     finally:
         if audio:
             audio.terminate()
